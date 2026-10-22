@@ -22,6 +22,8 @@ app.get('/api/drops/stream', (req, res) => {
         'Connection': 'keep-alive'
     })
     res.flushHeaders()
+
+    //Store the res line in sseClients
     sseClients.add(res)
     req.on('close', () => sseClients.delete(res))
 
@@ -29,12 +31,14 @@ app.get('/api/drops/stream', (req, res) => {
 
 app.get('/api/drops', async (req, res) => { 
     try { 
-        const result = await pool.query( 
-            'Select id AS "dropId", title, location AS loc, description AS "desc", quantity FROM drops WHERE ends_at > now() and quantity > 0 ORDER BY id DESC'
+        //Rename columns to match the live SSE messages ({dropId, title, loc, quantity, endsAt}) so App.tsx sees one shape
+        const result = await pool.query(
+          `SELECT id AS "dropId", title, location AS loc, quantity, ends_at AS "endsAt"
+           FROM drops
+           WHERE ends_at > now()
+           ORDER BY created_at DESC`
         )
         res.json(result.rows)
-
-
     }
     catch(err) { 
         console.error(err)
@@ -63,6 +67,8 @@ async function main() {
 
 
 
+
+
 //Defines Drop format 
 const DropInput = z.object({ 
     title: z.string().min(1),
@@ -78,14 +84,14 @@ type DropInput = z.infer<typeof DropInput>
 
 
 //Saves Drop to PostgreSQL Database    
-async function saveDrop(drop: DropInput): Promise<number> {
-    const result = await pool.query( 
+async function saveDrop(drop: DropInput): Promise<{ id: number; endsAt: Date }> {
+    const result = await pool.query(
         `INSERT INTO drops (title, location, description, quantity, ends_at)
         VALUES ($1, $2, $3, $4, now() + make_interval(mins => $5))
-         RETURNING id`,
+         RETURNING id, ends_at AS "endsAt"`,
         [drop.title, drop.loc, drop.desc, drop.quantity, drop.time]
     )
-    return result.rows[0].id
+    return result.rows[0]
     //line that saves it to database 
 }
 
@@ -110,14 +116,14 @@ async function relayRedis(id: number, drop: DropInput) {
     }
 }
 
-//After a claim, relay to redis that it should update the quantity
+//After a claim, copy the count Postgres decided on into Redis (Redis never subtracts on its own, so it can't go negative)
 
-async function updateRedis(id: number) { 
-    try { 
+async function updateRedis(id: number, remaining: number, endsAt: Date) {
+    try {
         const key = `drop:${id}`
 
-        //Keep all the other information, most importantly time until expiry the same, other than the remaining count 
-        return await client.hIncrBy(key, 'remaining', -1)
+        //EXPIREAT re-applies the drop's end time, so even if the key was missing and HSET recreates it, it still expires
+        await client.multi().hSet(key, 'remaining', remaining).expireAt(key, endsAt).exec()
     }
     catch (err) { 
         console.error(err)
@@ -137,13 +143,13 @@ app.post('/api/drops', async (req, res) => {
         return
     }
     const drop = result.data
-    const dropId = await saveDrop(drop) 
+    const { id: dropId, endsAt } = await saveDrop(drop)
 
-    //relay drop to save it on Redis so we can keep updating the remaing value 
+    //relay drop to save it on Redis so we can keep updating the remaing value
     await relayRedis(dropId, drop)
 
     //Send drop to Redis, which will relay to all subscribed servers
-    await client.publish("newDrops", JSON.stringify({type: "New", dropId: dropId, title: drop.title, loc: drop.loc, quantity: drop.quantity}))
+    await client.publish("newDrops", JSON.stringify({type: "New", dropId: dropId, title: drop.title, loc: drop.loc, quantity: drop.quantity, endsAt}))
 
     console.log("success"), res.status(201).json({dropId}) 
 })
@@ -157,19 +163,30 @@ app.post('/api/claims', async (req, res) => {
         return 
     }
     
-    
     //turn result into a number 
     const claimId = result.data.dropId
 
-    //2. use updateRedis() to update count of drop to Redis 
-    const new_quantity = await updateRedis(claimId)
+    //2. Postgres decides: check and subtract in ONE statement, so two people can't both take the last item
+    const claimed = await pool.query(
+        `UPDATE drops SET quantity = quantity - 1
+         WHERE id = $1 AND quantity > 0 AND ends_at > now()
+         RETURNING quantity, ends_at AS "endsAt"`,
+        [claimId]
+    )
 
-    //3. use client.publish to tell Redis to relay new count to all subscribed servers 
+    //No row updated = sold out, expired, or no such drop. Nothing changed, so tell nobody else
+    if (claimed.rowCount === 0) {
+        res.status(409).json({error: 'Drop is sold out, expired, or does not exist'})
+        return
+    }
+    const { quantity: new_quantity, endsAt } = claimed.rows[0]
+
+    //3. copy the new count into Redis
+    await updateRedis(claimId, new_quantity, endsAt)
+
+    //4. use client.publish to tell Redis to relay new count to all subscribed servers
     await client.publish("newDrops", JSON.stringify({type: "Claim", dropId: claimId, quantity: new_quantity  }))
 
-    //Also, sync PostGres count as well 
-    await pool.query(  'UPDATE drops SET quantity = $1 WHERE id = $2', [new_quantity, claimId]) 
-    
     console.log("success"), res.status(201).json({claimId}) 
 
 }

@@ -2,20 +2,9 @@ import { useState, useEffect, type SubmitEvent} from 'react'
 import './App.css'
 
 
-type Drop = { dropId: number; title: string; loc: string; quantity: number }
+//endsAt is an ISO timestamp string (JSON turns the server's Date into a string)
+type Drop = { dropId: number; title: string; loc: string; quantity: number; endsAt: string }
 
-//const evtSource = new EventSource("sse-demo.php");
-/*
-
-evtSource.onmessage = (event) => {
-  const newElement = document.createElement("li");
-  const eventList = document.getElementById("list");
-
-  newElement.textContent = `message: ${event.data}`;
-  eventList.appendChild(newElement);
-};
-
-/**/
 
 async function postDrop(title: string, loc: string, desc: string, quantity: number, time: number ){
     const c = await fetch ( '/api/drops', 
@@ -39,17 +28,38 @@ async function postClaim(dropId: number) {
   return c 
 }
 
-function App() {
 
+
+function App() {
+  
+  //title, loc, desc, quantity, time for CURRENT DROP YOU ARE TRYING TO POST, not of drops showing up on screen
   const [title, setTitle] = useState('')
   const [loc, setLoc] = useState('')
   const [desc, setDesc] = useState('')
   const [quantity, setQuantity] = useState('')
   const [time, setTime] = useState('')
+
+  //drops of Drops FROM SERVER OTHERS HAVE POSTED
   const [drops, setDrops] = useState<Drop[]>([])
+
+  //retrieve Drops on refresh or page opening 
+  async function loadDrops(){ 
+      const server_drops = await fetch ('/api/drops')
+      const server_drops_json = await server_drops.json()
+      setDrops(server_drops_json)
+    }
+
+  //await a get call to the server that receives all the current drops 
+  
+
+
+  //  setDrops ( .map(drops from serveer => drops) ) 
 
   //Listen in to live drop updates at /api/drops/stream
   useEffect( () => {
+    
+
+    loadDrops()
     const ev = new EventSource('/api/drops/stream') 
     ev.onmessage = (e) => { 
 
@@ -68,10 +78,23 @@ function App() {
 
      
     }
-    return () => { 
+    return () => {
       ev.close()
     }
-    
+
+  }, []
+  )
+
+  //Every second, remove drops whose endsAt has passed so expired drops disappear without a refresh
+  useEffect( () => {
+    const timer = setInterval(() => {
+      setDrops(prev => {
+        const live = prev.filter(d => new Date(d.endsAt).getTime() > Date.now())
+        //return the same array when nothing expired so React skips the re-render
+        return live.length === prev.length ? prev : live
+      })
+    }, 1000)
+    return () => clearInterval(timer)
   }, []
   )
 
