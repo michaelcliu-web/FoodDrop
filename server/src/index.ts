@@ -1,6 +1,7 @@
 import express from 'express'
 import { z } from 'zod'
 import {pool } from './db'
+import { startTimer, timingSummary, resetTimings } from './timing'
 
 //Create Redis Server
 import {createClient} from 'redis'
@@ -30,7 +31,8 @@ app.get('/api/drops/stream', (req, res) => {
 })
 
 app.get('/api/drops', async (req, res) => { 
-    try { 
+    const timer = startTimer('list', res)
+    try {
         //Rename columns to match the live SSE messages ({dropId, title, loc, quantity, endsAt}) so App.tsx sees one shape
         const result = await pool.query(
           `SELECT id AS "dropId", title, location AS loc, quantity, ends_at AS "endsAt"
@@ -38,6 +40,8 @@ app.get('/api/drops', async (req, res) => {
            WHERE ends_at > now()
            ORDER BY created_at DESC`
         )
+        timer.mark('postgres')
+        timer.done()
         res.json(result.rows)
     }
     catch(err) { 
@@ -46,13 +50,23 @@ app.get('/api/drops', async (req, res) => {
     }
 })
 
+//Per-step latency stats (p50/p99) for the benchmark script (npm run bench). 
+app.get('/api/debug/timings', (req, res) => { res.json(timingSummary()) })
+app.delete('/api/debug/timings', (req, res) => { resetTimings(); res.status(204).end() })
 
-async function main() { 
+
+async function main() {
     await client.connect()
     
 
     await subscription.connect()
-    
+
+    //Save claims left over from before a restart, 
+    //make sure every live drop has a Redis counter, then keep Postgres caught up
+    await flushClaimsToPostgres()
+    await rebuildRedisFromPostgres()
+    startClaimFlusher()
+
     //Calls parameter function that relays message to clients when a new Drop appears in newDrops 
     await subscription.subscribe("newDrops", (message) => {
         for (const res of sseClients) { 
@@ -116,21 +130,76 @@ async function relayRedis(id: number, drop: DropInput) {
     }
 }
 
-//After a claim, copy the count Postgres decided on into Redis (Redis never subtracts on its own, so it can't go negative)
+//Redis is the source of truth for live counts. 
+//Claims Postgres hasn't saved yet are counted here: field = dropId, value = how many
+const PENDING_KEY = 'claims:pending'
 
-async function updateRedis(id: number, remaining: number, endsAt: Date) {
-    try {
-        const key = `drop:${id}`
+//Runs inside Redis as ONE step, so two claims can't both take the last item.
+//Missing key = expired or no such drop. Returns the new remaining count, or -1 if the claim is refused
+const CLAIM_SCRIPT = `
+local remaining = tonumber(redis.call('HGET', KEYS[1], 'remaining'))
+if not remaining or remaining <= 0 then return -1 end
+redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
+return redis.call('HINCRBY', KEYS[1], 'remaining', -1)
+`
 
-        //EXPIREAT re-applies the drop's end time, so even if the key was missing and HSET recreates it, it still expires
-        await client.multi().hSet(key, 'remaining', remaining).expireAt(key, endsAt).exec()
+async function claimInRedis(id: number): Promise<number> {
+    return Number(await client.eval(CLAIM_SCRIPT, { keys: [`drop:${id}`, PENDING_KEY], arguments: [String(id)] }))
+}
+
+//Reads and clears the pending counts in one step, so a claim made during the flush is kept for the next one
+const TAKE_PENDING_SCRIPT = `
+local all = redis.call('HGETALL', KEYS[1])
+redis.call('DEL', KEYS[1])
+return all
+`
+
+//Saves pending claims to Postgres: one UPDATE per drop no matter how many claims piled up since the last flush
+async function flushClaimsToPostgres() {
+    const flat = await client.eval(TAKE_PENDING_SCRIPT, { keys: [PENDING_KEY] }) as string[]
+    for (let i = 0; i < flat.length; i += 2) {
+        const id = flat[i]
+        const count = Number(flat[i + 1])
+        try {
+            //quantity - count (not "= remaining") so updates are correct even if they land out of order
+            await pool.query('UPDATE drops SET quantity = quantity - $1 WHERE id = $2', [count, id])
+        }
+        catch (err) {
+            //put them back so the next flush retries instead of losing claims
+            console.error('Could not save claims to Postgres, will retry', err)
+            await client.hIncrBy(PENDING_KEY, id, count)
+        }
     }
-    catch (err) { 
-        console.error(err)
-        throw err
+}
+
+//Every FLUSH_MS, catch Postgres up with new info. 
+//The flag stops a slow flush from overlapping the next one
+const FLUSH_MS = 200
+function startClaimFlusher() {
+    let flushing = false
+    setInterval(async () => {
+        if (flushing) return
+        flushing = true
+        try { await flushClaimsToPostgres() }
+        catch (err) { console.error(err) }
+        finally { flushing = false }
+    }, FLUSH_MS)
+}
+
+//If Redis loses data, recreate the data including counters for live drops from Postgres.
+async function rebuildRedisFromPostgres() {
+    const { rows } = await pool.query(
+        `SELECT id, quantity, ends_at AS "endsAt" FROM drops WHERE ends_at > now() AND quantity > 0`
+    )
+    let rebuilt = 0
+    for (const d of rows) {
+        const key = `drop:${d.id}`
+        if (await client.hSetNX(key, 'remaining', String(d.quantity))) {
+            await client.expireAt(key, d.endsAt)
+            rebuilt++
+        }
     }
-
-
+    if (rebuilt) console.log(`Rebuilt ${rebuilt} Redis counters from Postgres`)
 }
 
 
@@ -143,13 +212,18 @@ app.post('/api/drops', async (req, res) => {
         return
     }
     const drop = result.data
+    const timer = startTimer('post', res)
     const { id: dropId, endsAt } = await saveDrop(drop)
+    timer.mark('postgres')
 
     //relay drop to save it on Redis so we can keep updating the remaing value
     await relayRedis(dropId, drop)
+    timer.mark('redis')
 
     //Send drop to Redis, which will relay to all subscribed servers
     await client.publish("newDrops", JSON.stringify({type: "New", dropId: dropId, title: drop.title, loc: drop.loc, quantity: drop.quantity, endsAt}))
+    timer.mark('publish')
+    timer.done()
 
     console.log("success"), res.status(201).json({dropId}) 
 })
@@ -166,26 +240,22 @@ app.post('/api/claims', async (req, res) => {
     //turn result into a number 
     const claimId = result.data.dropId
 
-    //2. Postgres decides: check and subtract in ONE statement, so two people can't both take the last item
-    const claimed = await pool.query(
-        `UPDATE drops SET quantity = quantity - 1
-         WHERE id = $1 AND quantity > 0 AND ends_at > now()
-         RETURNING quantity, ends_at AS "endsAt"`,
-        [claimId]
-    )
+    //2. Redis decides: check and subtract in one Lua script (microseconds, no disk). Postgres catches up in the background flusher
+    const timer = startTimer('claim', res)
+    const new_quantity = await claimInRedis(claimId)
+    timer.mark('redis')
 
-    //No row updated = sold out, expired, or no such drop. Nothing changed, so tell nobody else
-    if (claimed.rowCount === 0) {
+    //-1 = sold out, expired, or no such drop. Nothing changed, so tell nobody else
+    if (new_quantity < 0) {
+        timer.done()
         res.status(409).json({error: 'Drop is sold out, expired, or does not exist'})
         return
     }
-    const { quantity: new_quantity, endsAt } = claimed.rows[0]
 
-    //3. copy the new count into Redis
-    await updateRedis(claimId, new_quantity, endsAt)
-
-    //4. use client.publish to tell Redis to relay new count to all subscribed servers
+    //3. use client.publish to tell Redis to relay new count to all subscribed servers
     await client.publish("newDrops", JSON.stringify({type: "Claim", dropId: claimId, quantity: new_quantity  }))
+    timer.mark('publish')
+    timer.done()
 
     console.log("success"), res.status(201).json({claimId}) 
 

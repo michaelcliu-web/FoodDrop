@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "dev": "tsx watch src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "bench": "tsx bench/bench.ts"
   },
   "keywords": [],
   "author": "",
@@ -18,9 +19,11 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@types/autocannon": "^7.12.7",
     "@types/express": "^5.0.6",
     "@types/node": "^26.6.3",
     "@types/pg": "^8.23.1",
+    "autocannon": "^8.0.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
