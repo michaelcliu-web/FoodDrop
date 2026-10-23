@@ -1,5 +1,29 @@
-import { useState, useEffect, type SubmitEvent} from 'react'
+import { useState, useEffect, useRef, type SubmitEvent} from 'react'
 import './App.css'
+
+//Display helper : "until 3:45 PM"
+function endTime(endsAt: string) {
+  return new Date(endsAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+}
+
+//Small icons for the location / time line under each title
+function PinIcon() {
+  return (
+    <svg className="meta-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <path d="M8 15s5-4.6 5-8.5A5 5 0 0 0 3 6.5C3 10.4 8 15 8 15Z" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="8" cy="6.5" r="1.8" fill="currentColor" />
+    </svg>
+  )
+}
+function ClockIcon() {
+  return (
+    <svg className="meta-icon" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M8 4.5V8l2.4 1.6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 
 
 //endsAt is an ISO timestamp string (JSON turns the server's Date into a string)
@@ -41,6 +65,9 @@ function App() {
 
   //drops of Drops FROM SERVER OTHERS HAVE POSTED
   const [drops, setDrops] = useState<Drop[]>([])
+
+  //the "Post a drop" popup (a native <dialog>, so Esc closes it for free)
+  const postDialog = useRef<HTMLDialogElement>(null)
 
   //retrieve Drops on refresh or page opening 
   async function loadDrops(){ 
@@ -109,7 +136,7 @@ function App() {
         setDesc('')
         setQuantity('')
         setTime('')
-      
+        postDialog.current?.close()
       }
       catch { 
         alert("Couldn't post, try again")
@@ -130,35 +157,84 @@ function App() {
 
 
 
-    <div> 
-      <h1>FoodDrop </h1>
+    <div className="app">
+      <header className="topbar">
+        <h1>FoodDrop</h1>
+      </header>
 
-      
-      <form onSubmit = {handleSubmit}> 
-        <input value = {title} onChange = { e => setTitle(e.target.value)} placeholder = 'Title' /> 
-        <input value = {desc} onChange = {e => setDesc(e.target.value)} placeholder = 'Description' /> 
-        <input value = {loc} onChange = {e => setLoc(e.target.value)} placeholder = 'Location' /> 
-        <input type = "number" value = {quantity} onChange = {e => setQuantity(e.target.value)} placeholder = 'Quantity' /> 
-        <input type = "number" value = {time} onChange = {e => setTime(e.target.value)} placeholder = 'Time Available' /> 
-        <button type = "submit"> 
-          Post 
-        </button> 
-      </form>
+      {/* The scrollable forum of drops */}
+      <main className="feed">
+        {drops.length === 0 && (
+          <div className="empty">
+            <h2>No food right now</h2>
+            <p>Check back soon, or be the hero and post some.</p>
+          </div>
+        )}
 
- 
-      <ul> 
-        {drops.map((d) => (
-            <li key = {d.dropId}> 
-              {d.title} at {d.loc} with {d.quantity} left 
-            
-            <button onClick = {() => handleClaim(d)}> 
-                claim 
-             </button> 
-            </li>  
-        ))} 
-      </ul>
-  
-    </div> 
+        <ul className="drop-list">
+          {drops.map((d) => (
+              <li key = {d.dropId} className={`drop ${d.quantity === 0 ? 'gone' : ''}`}>
+                <div className="drop-body">
+                  <h2 className="drop-title">{d.title}</h2>
+                  <p className="drop-meta">
+                    <span><PinIcon />{d.loc}</span>
+                    <span><ClockIcon />until {endTime(d.endsAt)}</span>
+                  </p>
+                </div>
+
+                <div className="drop-actions">
+                  <p className="drop-left"><strong>{d.quantity}</strong> left</p>
+                  <button className="claim-btn" disabled={d.quantity === 0} onClick = {() => handleClaim(d)}>
+                      {d.quantity === 0 ? 'All gone' : 'Claim'}
+                  </button>
+                </div>
+              </li>
+          ))}
+        </ul>
+      </main>
+
+      {/* Bottom right: opens the post form */}
+      <button className="post-btn" onClick={() => postDialog.current?.showModal()}>
+        <span aria-hidden="true">+</span> Post a drop
+      </button>
+
+      {/* The post form, in a popup. Clicking the dim backdrop closes it */}
+      <dialog ref={postDialog} className="post-dialog" onClick={e => { if (e.target === e.currentTarget) e.currentTarget.close() }}>
+        <form onSubmit = {handleSubmit}>
+          <h2>Post a drop</h2>
+
+          <label>
+            What's the food?
+            <input required value = {title} onChange = { e => setTitle(e.target.value)} placeholder = 'Leftover pizza' />
+          </label>
+          <label>
+            Description
+            <input value = {desc} onChange = {e => setDesc(e.target.value)} placeholder = 'Cheese and pepperoni, still warm' />
+          </label>
+          <label>
+            Where?
+            <input required value = {loc} onChange = {e => setLoc(e.target.value)} placeholder = 'Bass Library, 2nd floor' />
+          </label>
+          <div className="field-row">
+            <label>
+              How many?
+              <input required type = "number" min="1" value = {quantity} onChange = {e => setQuantity(e.target.value)} placeholder = '10' />
+            </label>
+            <label>
+              Available for (min)
+              <input required type = "number" min="1" value = {time} onChange = {e => setTime(e.target.value)} placeholder = '30' />
+            </label>
+          </div>
+
+          <div className="dialog-actions">
+            <button type="button" className="cancel-btn" onClick={() => postDialog.current?.close()}>Cancel</button>
+            <button type = "submit" className="submit-btn">
+              Post
+            </button>
+          </div>
+        </form>
+      </dialog>
+    </div>
   )
 }
 
